@@ -3,9 +3,9 @@
 LANIS is an unofficial wrapper around Schulportal Hessen (SPH). SPH is the official learning
 platform; the routes below are LANIS routes that retrieve or modify data in SPH.
 
-Base URL: `https://api.lanis.arg-server.de`
+Base URL: `https://lanis-backend.joancode.dev`
 
-Interactive documentation: `https://api.lanis.arg-server.de/documentation`
+Interactive documentation: `https://lanis-backend.joancode.dev/documentation`
 
 Authenticated endpoints require `X-Session-Token: <access_token>`. JSON is used unless noted.
 
