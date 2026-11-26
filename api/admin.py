@@ -823,12 +823,13 @@ async def admin_metrics_analytics(
     )
     retention_since -= timedelta(days=retention_since.weekday())
     await user_metrics_db.initialize()
-    growth, heatmap, modules, retention, login_series = await asyncio.gather(
+    growth, heatmap, modules, retention, login_series, new_users = await asyncio.gather(
         user_metrics_db.get_growth_series(range_since),
         user_metrics_db.get_usage_heatmap(range_since),
         user_metrics_db.get_module_usage(range_since),
         user_metrics_db.get_retention_cohorts(retention_since, now=now),
         user_metrics_db.get_login_series(baseline_since),
+        user_metrics_db.get_new_user_journey(range_since, now),
     )
 
     values = {str(item["day"]): int(item["logins"]) for item in login_series}
@@ -887,11 +888,12 @@ async def admin_metrics_analytics(
         "module_usage": modules,
         "anomalies": list(reversed(anomalies[-25:])),
         "retention": retention,
+        "new_user_journey": new_users,
         "definitions": {
             "heatmap": "Erfasste authentifizierte Aktivität nach Wochentag und UTC-Stunde.",
             "modules": "Erfolgreiche App-Starts seit Beginn der Aufzeichnung; ältere Starts sind nicht rückwirkend verfügbar.",
             "anomalies": "Ein Tag wird markiert, wenn die Anmeldungen deutlich vom Durchschnitt der sieben vorherigen Tage abweichen.",
-            "retention": "Anteil einer wöchentlichen Erstnutzungs-Kohorte, die exakt am 1., 7. oder 30. Tag wieder aktiv war.",
+            "retention": "Anteil einer wöchentlichen Erstnutzungs-Kohorte, die exakt am 1., 7. oder 30. Tag wieder aktiv war. Pro Quote zählen Konten, für die der jeweilige Tag vollständig vergangen ist.",
         },
     }
 

@@ -198,6 +198,53 @@ def test_analytics_aggregates_activity_and_module_launches(tmp_path):
     asyncio.run(scenario())
 
 
+def test_new_user_journey_counts_complete_weeks_and_distinct_accounts(tmp_path):
+    database = UserMetricsDB(tmp_path / "metrics.db")
+
+    async def scenario():
+        await database.initialize()
+        async with aiosqlite.connect(database.db_path) as db:
+            await db.executemany(
+                """
+                INSERT INTO users (school_id, login, data_hash, user_data, first_seen)
+                VALUES (?, 'student', 'hash', '{}', ?)
+                """,
+                [
+                    ("5201", "2026-09-14 12:00:00"),
+                    ("5202", "2026-09-14T12:00:00"),
+                    ("5203", "2026-09-15T12:00:00"),
+                ],
+            )
+            await db.executemany(
+                """
+                INSERT INTO activity_events (event_type, school_id, login, occurred_at, action)
+                VALUES ('module_open', ?, 'student', ?, ?)
+                """,
+                [
+                    ("5201", "2026-09-14T11:59:59", "Before"),
+                    ("5201", "2026-09-14T12:00:00", "Kalender"),
+                    ("5201", "2026-09-21T23:59:59", "Kalender"),
+                    ("5202", "2026-09-22T00:00:00", "After"),
+                    ("5203", "2026-09-16T12:00:00", "Pending"),
+                ],
+            )
+            await db.commit()
+
+        assert await database.get_new_user_journey(
+            datetime(2026, 9, 14), datetime(2026, 9, 22, 12)
+        ) == {
+            "days": [
+                {"day": "2026-09-14", "new_users": 2, "eligible": 2,
+                 "returned": 1, "opened_module": 1},
+                {"day": "2026-09-15", "new_users": 1, "eligible": 0,
+                 "returned": 0, "opened_module": 0},
+            ],
+            "modules": [{"module": "Kalender", "unique_users": 1, "launches": 2}],
+        }
+
+    asyncio.run(scenario())
+
+
 def test_retention_uses_only_mature_users_in_each_cohort(tmp_path):
     database = UserMetricsDB(tmp_path / "metrics.db")
 
