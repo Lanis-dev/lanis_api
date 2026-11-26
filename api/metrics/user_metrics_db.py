@@ -848,6 +848,72 @@ class UserMetricsDB:
                 for row in await cursor.fetchall()
             ]
 
+    async def get_new_user_journey(self, since: datetime, now: datetime) -> Dict[str, Any]:
+        """Summarize first-week activity by first-seen UTC date."""
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            # Both outcomes use the same set of accounts with seven complete
+            # UTC days after first seen. Module use also includes day zero.
+            async with db.execute(
+                """
+                WITH newcomers AS (
+                    SELECT id, school_id, login, date(first_seen) AS day,
+                           replace(first_seen, ' ', 'T') AS started,
+                           date(first_seen, '+8 days') AS week_end
+                    FROM users
+                    WHERE date(first_seen) >= date(:since)
+                      AND replace(first_seen, ' ', 'T') <= :now
+                ),
+                first_week AS (
+                    SELECT n.id, n.day, e.event_type, e.action,
+                           date(e.occurred_at) AS event_day
+                    FROM activity_events e
+                    JOIN newcomers n ON n.school_id = e.school_id AND n.login = e.login
+                    WHERE e.event_type IN ('login', 'activity', 'module_open')
+                      AND e.occurred_at >= :since AND e.occurred_at <= :now
+                      AND n.week_end <= date(:now)
+                      AND e.occurred_at >= n.started
+                      AND date(e.occurred_at) < n.week_end
+                ),
+                outcomes AS (
+                    SELECT id, MAX(event_day > day) AS returned,
+                           MAX(event_type = 'module_open') AS opened_module
+                    FROM first_week
+                    GROUP BY id
+                )
+                SELECT 'day' AS kind, n.day AS label, COUNT(*) AS accounts,
+                       SUM(n.week_end <= date(:now)) AS eligible,
+                       SUM(COALESCE(o.returned, 0)) AS returned,
+                       SUM(COALESCE(o.opened_module, 0)) AS opened_module
+                FROM newcomers n LEFT JOIN outcomes o ON o.id = n.id
+                GROUP BY n.day
+                UNION ALL
+                SELECT 'module', COALESCE(action, 'Unbekannt'),
+                       COUNT(DISTINCT id), COUNT(*), NULL, NULL
+                FROM first_week
+                WHERE event_type = 'module_open'
+                GROUP BY COALESCE(action, 'Unbekannt')
+                ORDER BY kind, label
+                """,
+                {"since": since.isoformat(), "now": now.isoformat()},
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return {
+            "days": [
+                {"day": row["label"], "new_users": row["accounts"],
+                 "eligible": row["eligible"], "returned": row["returned"],
+                 "opened_module": row["opened_module"]}
+                for row in rows if row["kind"] == "day"
+            ],
+            "modules": sorted(
+                [{"module": row["label"], "unique_users": row["accounts"],
+                  "launches": row["eligible"]}
+                 for row in rows if row["kind"] == "module"],
+                key=lambda module: (-module["unique_users"], module["module"].casefold()),
+            )[:100],
+        }
+
     async def get_retention_cohorts(
         self, since: datetime, now: Optional[datetime] = None
     ) -> List[Dict[str, Any]]:
