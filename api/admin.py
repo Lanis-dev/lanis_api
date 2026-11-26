@@ -893,7 +893,7 @@ async def admin_metrics_analytics(
             "heatmap": "Erfasste authentifizierte Aktivität nach Wochentag und UTC-Stunde.",
             "modules": "Erfolgreiche App-Starts seit Beginn der Aufzeichnung; ältere Starts sind nicht rückwirkend verfügbar.",
             "anomalies": "Ein Tag wird markiert, wenn die Anmeldungen deutlich vom Durchschnitt der sieben vorherigen Tage abweichen.",
-            "retention": "Anteil einer wöchentlichen Erstnutzungs-Kohorte, die exakt am 1., 7. oder 30. Tag wieder aktiv war.",
+            "retention": "Anteil einer wöchentlichen Erstnutzungs-Kohorte, die exakt am 1., 7. oder 30. Tag wieder aktiv war. Pro Quote zählen Konten, für die der jeweilige Tag vollständig vergangen ist.",
         },
     }
 
