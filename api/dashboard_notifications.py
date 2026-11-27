@@ -249,9 +249,9 @@ def _table_value(headers: list[Any], row: Any, patterns: Iterable[str]) -> str:
 
 
 def dsb_plan_items(
-    result: dict[str, Any], target_class: str = ""
+    result: dict[str, Any], target_class: str | None = ""
 ) -> list[dict[str, Any]]:
-    """Return class-relevant DSBmobile rows, including caption-scoped tables."""
+    """Return DSBmobile rows for the given classes, or all rows for None."""
     items: list[dict[str, Any]] = []
     for table in result.get("tables") or []:
         if not isinstance(table, dict):
@@ -264,7 +264,7 @@ def dsb_plan_items(
         for row in table.get("rows") or []:
             class_name = _table_value(headers, row, ("klasse", "class"))
             effective_class = class_name or caption
-            if not _matches_class(effective_class, target_class):
+            if target_class is not None and not _matches_class(effective_class, target_class):
                 continue
             subject = _table_value(headers, row, ("fach", "subject"))
             kind = _first_text(
@@ -274,8 +274,12 @@ def dsb_plan_items(
             )
             period = _table_value(headers, row, ("stunde", "std", "period"))
             room = _table_value(headers, row, ("raum", "room"))
-            shown_class = class_name or (
-                target_class if _matches_class(caption, target_class) else ""
+            shown_class = class_name or next(
+                (
+                    name for name in (target_class or "").split(",")
+                    if _matches_class(caption, name)
+                ),
+                caption,
             )
             detail = " · ".join(
                 filter(

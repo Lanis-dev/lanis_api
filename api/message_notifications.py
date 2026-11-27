@@ -36,12 +36,17 @@ from .auth_db import (
     save_vertretungsplan_notification_state,
 )
 
+from .dashboard_notifications import dsb_plan_items
 from .message_read_state import overlay_headers
 
 logger = logging.getLogger("message_notifications")
 
 SCHEDULER_TICK_SECONDS = 60
 MAX_CONCURRENT_USER_POLLS = 4
+DSB_POLL_INTERVAL_MINUTES = 5
+DSB_POLL_START = time(7)
+DSB_POLL_END = time(16)
+DsbPlanLoader = Callable[[str], Awaitable[Dict[str, Any] | None]]
 CLOCK_PATTERN = re.compile(r"^\d{2}:\d{2}$")
 PERMANENT_PUSH_STATUS_CODES = frozenset({404, 410})
 MESSAGE_PUSH_TTL_SECONDS = 24 * 60 * 60
@@ -336,6 +341,18 @@ def is_notification_window_open(
     if start < end:
         return start <= current < end
     return current >= start or current < end
+
+
+def _dsb_poll_slot(now: datetime | None = None) -> datetime | None:
+    berlin = ZoneInfo("Europe/Berlin")
+    local_now = datetime.now(berlin) if now is None else now.astimezone(berlin)
+    if not DSB_POLL_START <= local_now.time() < DSB_POLL_END:
+        return None
+    return local_now.replace(
+        minute=local_now.minute - local_now.minute % DSB_POLL_INTERVAL_MINUTES,
+        second=0,
+        microsecond=0,
+    )
 
 
 def _is_due(state: Dict[str, Any] | None, interval_minutes: int, now: datetime) -> bool:
@@ -739,126 +756,22 @@ async def check_user_messages(
     return bool(changed_ids)
 
 
-async def _record_failed_vertretungsplan_poll(
-    user_id: str, previous_state: Dict[str, Any] | None, checked_at: datetime
-) -> None:
-    state = dict(previous_state) if isinstance(previous_state, dict) else {}
-    state["checked_at"] = checked_at.isoformat()
-    try:
-        await save_vertretungsplan_notification_state(user_id, state)
-    except Exception as error:
-        logger.warning(
-            "Failed to record Vertretungsplan poll attempt for %s: %s", user_id, error
-        )
-
-
-@observe("api.message_notifications.check_user_vertretungsplan")
-async def check_user_vertretungsplan(
-    user: Dict[str, Any],
-    get_client: Callable[[str], Awaitable[Any]],
-    now: datetime | None = None,
+async def _deliver_plan_updates(
+    user_id: str,
+    previous_state: Dict[str, Any],
+    scope: Dict[str, Any],
+    snapshot: Dict[str, str],
+    summaries: Dict[str, str],
+    subscriptions: List[Dict[str, Any]],
+    *,
+    dsb: bool = False,
     invalidate_cache: Callable[[str, str], Awaitable[None]] | None = None,
-    get_preferences: Callable[[str], Awaitable[Dict[str, Any]]] | None = None,
-) -> bool:
-    """Poll one user's plan and notify only for newly appearing matching entries."""
-    user_id = str(user["user_id"])
-    if (
-        not user.get("enabled")
-        or not user.get("vertretungsplan_enabled", False)
-        or not is_notification_window_open(user, now)
-    ):
-        return False
-
-    try:
-        timezone = ZoneInfo(str(user["timezone"]))
-    except (KeyError, ZoneInfoNotFoundError):
-        logger.warning("Vertretungsplan notification poll skipped for %s: invalid timezone", user_id)
-        return False
-    local_now = datetime.now(timezone) if now is None else now.astimezone(timezone)
-    previous_state = await get_vertretungsplan_notification_state(user_id)
-    try:
-        interval = int(user.get("poll_interval_minutes", 15))
-    except (TypeError, ValueError):
-        logger.warning("Vertretungsplan notification poll skipped for %s: invalid interval", user_id)
-        return False
-    if not _is_due(previous_state, interval, local_now):
-        return False
-
-    subscriptions = await get_push_subscriptions(user_id)
-    if not subscriptions:
-        return False
-
-    try:
-        session_data = await get_client(user_id)
-        client = getattr(session_data, "client", session_data)
-        plan_result = await run_in_threadpool(client.vertretungsplan_get_plan, False)
-    except Exception as error:
-        logger.warning("Vertretungsplan notification poll failed for %s: %s", user_id, error)
-        await _record_failed_vertretungsplan_poll(user_id, previous_state, local_now)
-        return False
-
-    if not plan_result.get("success"):
-        logger.warning(
-            "Vertretungsplan notification poll returned an error for %s: %s",
-            user_id,
-            plan_result.get("error"),
-        )
-        await _record_failed_vertretungsplan_poll(user_id, previous_state, local_now)
-        return False
-
-    current_user = user
-    if get_preferences:
-        try:
-            current_user = {**user, **(await get_preferences(user_id))}
-        except Exception as error:
-            logger.warning("Vertretungsplan preferences read failed for %s: %s", user_id, error)
-            await _record_failed_vertretungsplan_poll(user_id, previous_state, local_now)
-            return False
-        if (
-            not current_user.get("enabled")
-            or not current_user.get("vertretungsplan_enabled", False)
-            or not is_notification_window_open(current_user, now)
-        ):
-            return False
-        previous_state = await get_vertretungsplan_notification_state(user_id)
-
-    profile_result: Dict[str, Any] = {"success": True, "data": {}}
-    if str(current_user.get("vertretungsplan_class_mode") or "own") == "own":
-        try:
-            profile_result = await run_in_threadpool(client.benutzer_get_data)
-        except Exception as error:
-            logger.warning(
-                "Vertretungsplan profile fetch failed for %s: %s", user_id, error
-            )
-            await _record_failed_vertretungsplan_poll(
-                user_id, previous_state, local_now
-            )
-            return False
-
-    own_class = vertretungsplan_notification_options(profile_result, plan_result)["own_class"]
-    if (
-        str(current_user.get("vertretungsplan_class_mode") or "own") == "own"
-        and not own_class
-    ):
-        logger.warning(
-            "Vertretungsplan notification poll skipped for %s: own class is unavailable",
-            user_id,
-        )
-        await _record_failed_vertretungsplan_poll(user_id, previous_state, local_now)
-        return False
-    current_snapshot, details = build_vertretungsplan_snapshot(
-        plan_result, current_user, own_class
-    )
-    current_scope = _vertretungsplan_scope(current_user, own_class)
-    scope_matches = (
-        isinstance(previous_state, dict)
-        and previous_state.get("scope") == current_scope
-    )
-    has_baseline = scope_matches and "entries" in previous_state
-    previous_snapshot = (previous_state or {}).get("entries") or {}
-    if not isinstance(previous_snapshot, dict):
-        previous_snapshot = {}
-    new_ids = [entry_id for entry_id in current_snapshot if has_baseline and entry_id not in previous_snapshot]
+) -> Tuple[Dict[str, Any], bool]:
+    previous_entries = previous_state.get("entries")
+    scope_matches = previous_state.get("scope") == scope
+    new_ids = []
+    if scope_matches and isinstance(previous_entries, dict):
+        new_ids = [entry_id for entry_id in snapshot if entry_id not in previous_entries]
 
     subscriptions_by_endpoint = {
         subscription["endpoint"]: subscription
@@ -876,21 +789,13 @@ async def check_user_vertretungsplan(
                 await invalidate_cache(user_id, "/vertretungsplan")
             except Exception as error:
                 logger.warning("Vertretungsplan cache invalidation failed for %s: %s", user_id, error)
-        first = details[new_ids[0]]
-        summary_parts = [
-            first[key]
-            for key in ("date", "class", "period", "subject", "kind")
-            if first[key]
-        ]
-        body = " · ".join(summary_parts) or "Der Vertretungsplan wurde ergänzt."
+        body = summaries[new_ids[0]] or "Der Vertretungsplan wurde ergänzt."
         if len(new_ids) > 1:
             body = f"{len(new_ids)} neue Einträge für deine Auswahl"
+        plan_name = "DSBmobile" if dsb else "Vertretungsplan"
+        title = "Neuer Eintrag" if len(new_ids) == 1 else "Neue Einträge"
         payload = {
-            "title": (
-                "Neuer Eintrag im Vertretungsplan"
-                if len(new_ids) == 1
-                else "Neue Einträge im Vertretungsplan"
-            ),
+            "title": f"{title} im {plan_name}",
             "body": body,
             "url": "/dsb",
             "tag": f"lanis-vertretungsplan-{new_ids[0]}",
@@ -901,22 +806,161 @@ async def check_user_vertretungsplan(
     deliveries = {
         endpoint: (subscriptions_by_endpoint[endpoint], queued[-1])
         for endpoint, queued in pending_deliveries.items()
-        if queued and endpoint in subscriptions_by_endpoint
+        if queued
     }
     statuses = await _send_push_payloads(user_id, deliveries) if deliveries else {}
     for endpoint, status in statuses.items():
         if status in {"delivered", "gone"}:
             pending_deliveries.pop(endpoint, None)
 
-    next_state: Dict[str, Any] = {
-        "checked_at": local_now.isoformat(),
-        "entries": current_snapshot,
-        "scope": current_scope,
-    }
+    next_state: Dict[str, Any] = {"entries": snapshot, "scope": scope}
     if pending_deliveries:
         next_state["pending_deliveries"] = pending_deliveries
+    return next_state, bool(new_ids)
+
+
+@observe("api.message_notifications.check_user_vertretungsplan")
+async def check_user_vertretungsplan(
+    user: Dict[str, Any],
+    get_client: Callable[[str], Awaitable[Any]],
+    now: datetime | None = None,
+    invalidate_cache: Callable[[str, str], Awaitable[None]] | None = None,
+    get_preferences: Callable[[str], Awaitable[Dict[str, Any]]] | None = None,
+    *,
+    get_dsb_plan: DsbPlanLoader | None = None,
+) -> bool:
+    """Check the native and school-wide DSBmobile plans for matching updates."""
+    user_id = str(user["user_id"])
+    if not user.get("enabled") or not user.get("vertretungsplan_enabled", False):
+        return False
+
+    dsb_due = get_dsb_plan is not None and _dsb_poll_slot(now) is not None
+    native_window_open = is_notification_window_open(user, now)
+    if not (native_window_open or dsb_due):
+        return False
+
+    previous_state = await get_vertretungsplan_notification_state(user_id) or {}
+    native_checked_at = None
+    if native_window_open:
+        timezone = ZoneInfo(str(user["timezone"]))
+        local_now = datetime.now(timezone) if now is None else now.astimezone(timezone)
+        try:
+            interval = int(user.get("poll_interval_minutes", 15))
+        except (TypeError, ValueError):
+            logger.warning("Vertretungsplan notification poll skipped for %s: invalid interval", user_id)
+        else:
+            if _is_due(previous_state, interval, local_now):
+                native_checked_at = local_now.isoformat()
+    if native_checked_at is None and not dsb_due:
+        return False
+
+    subscriptions = await get_push_subscriptions(user_id)
+    if not subscriptions:
+        return False
+
+    dsb_result = None
+    if get_dsb_plan is not None and dsb_due and _dsb_poll_slot(now) is not None:
+        try:
+            dsb_result = await get_dsb_plan(user.get("school_id", ""))
+        except Exception as error:
+            logger.warning("DSBmobile notification poll failed for %s: %s", user_id, error)
+    if dsb_result and not dsb_result.get("success"):
+        logger.warning("DSBmobile notification poll returned an error for %s", user_id)
+
+    dsb_available = bool(dsb_result and dsb_result.get("success"))
+    if native_checked_at is None and not dsb_available:
+        return False
+
+    client = None
+    plan_result = {}
+    try:
+        session_data = await get_client(user_id)
+        client = getattr(session_data, "client", session_data)
+        if native_checked_at is not None:
+            plan_result = await run_in_threadpool(client.vertretungsplan_get_plan, False)
+    except Exception as error:
+        logger.warning("Vertretungsplan notification poll failed for %s: %s", user_id, error)
+    if plan_result and not plan_result.get("success"):
+        logger.warning(
+            "Vertretungsplan notification poll returned an error for %s: %s",
+            user_id,
+            plan_result.get("error"),
+        )
+
+    current_user = user
+    if get_preferences:
+        try:
+            current_user = {**user, **(await get_preferences(user_id))}
+        except Exception as error:
+            logger.warning("Vertretungsplan preferences read failed for %s: %s", user_id, error)
+            if native_checked_at is not None:
+                await save_vertretungsplan_notification_state(
+                    user_id, {**previous_state, "checked_at": native_checked_at}
+                )
+            return False
+        if not current_user.get("enabled") or not current_user.get("vertretungsplan_enabled", False):
+            return False
+        if not is_notification_window_open(current_user, now):
+            native_checked_at = None
+        previous_state = await get_vertretungsplan_notification_state(user_id) or {}
+
+    next_state = dict(previous_state)
+    if native_checked_at is not None:
+        next_state["checked_at"] = native_checked_at
+    native_available = native_checked_at is not None and bool(plan_result.get("success"))
+    if not (native_available or dsb_available):
+        if native_checked_at is not None:
+            await save_vertretungsplan_notification_state(user_id, next_state)
+        return False
+
+    own_class = ""
+    if str(current_user.get("vertretungsplan_class_mode") or "own") == "own":
+        if client is not None:
+            try:
+                profile = await run_in_threadpool(client.benutzer_get_data)
+                own_class = vertretungsplan_notification_options(profile, {})["own_class"]
+            except Exception as error:
+                logger.warning("Vertretungsplan profile fetch failed for %s: %s", user_id, error)
+        if not own_class:
+            logger.warning(
+                "Vertretungsplan notification poll skipped for %s: own class is unavailable",
+                user_id,
+            )
+            await save_vertretungsplan_notification_state(user_id, next_state)
+            return False
+
+    scope = _vertretungsplan_scope(current_user, own_class)
+    native_changed = dsb_changed = False
+    if native_available:
+        snapshot, details = build_vertretungsplan_snapshot(plan_result, current_user, own_class)
+        summaries = {
+            entry_id: " · ".join(
+                detail[key] for key in ("date", "class", "period", "subject", "kind") if detail[key]
+            )
+            for entry_id, detail in details.items()
+        }
+        native_state, native_changed = await _deliver_plan_updates(
+            user_id, previous_state, scope, snapshot, summaries, subscriptions,
+            invalidate_cache=invalidate_cache,
+        )
+        next_state.pop("pending_deliveries", None)
+        next_state.update(native_state)
+
+    if dsb_available:
+        target_class = None if scope["mode"] == "all" else ",".join(scope["classes"])
+        items = dsb_plan_items(dsb_result, target_class)
+        snapshot = {item["id"]: "" for item in items}
+        summaries = {
+            item["id"]: " · ".join(filter(None, (item["meta"], item["detail"], item["title"])))
+            for item in items
+        }
+        next_state["dsb"], dsb_changed = await _deliver_plan_updates(
+            user_id, previous_state.get("dsb") or {}, scope, snapshot, summaries,
+            subscriptions, dsb=True,
+        )
+
     await save_vertretungsplan_notification_state(user_id, next_state)
-    return bool(new_ids)
+    return native_changed or dsb_changed
 
 
 @observe("api.message_notifications.run_message_notification_cycle")
@@ -924,10 +968,21 @@ async def run_message_notification_cycle(
     get_client: Callable[[str], Awaitable[Any]],
     invalidate_cache: Callable[[str, str], Awaitable[None]] | None = None,
     get_preferences: Callable[[str], Awaitable[Dict[str, Any]]] | None = None,
+    *,
+    get_dsb_plan: DsbPlanLoader | None = None,
+    now: datetime | None = None,
 ) -> None:
     """Run one bounded polling cycle for all enabled users."""
     users = await get_enabled_notification_users()
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_USER_POLLS)
+    dsb_plans: Dict[str, asyncio.Future[Dict[str, Any] | None]] = {}
+
+    async def load_dsb_plan(school_id: str) -> Dict[str, Any] | None:
+        if not get_dsb_plan or not school_id:
+            return None
+        if school_id not in dsb_plans:
+            dsb_plans[school_id] = asyncio.ensure_future(get_dsb_plan(school_id))
+        return await dsb_plans[school_id]
 
     async def check_with_limit(user: Dict[str, Any]) -> None:
         async with semaphore:
@@ -943,7 +998,8 @@ async def run_message_notification_cycle(
                     return
                 lock = await account_lifecycle_lock(user_id)
                 async with lock.shared():
-                    if not await get_refresh_token_by_user_id(user_id):
+                    session = await get_refresh_token_by_user_id(user_id)
+                    if not session:
                         return
                     if invalidate_cache is None and get_preferences is None:
                         await check_user_messages(user, get_client)
@@ -955,10 +1011,12 @@ async def run_message_notification_cycle(
                             get_preferences=get_preferences,
                         )
                     await check_user_vertretungsplan(
-                        user,
+                        {**user, "school_id": session.get("school_id", "")},
                         get_client,
+                        now=now,
                         invalidate_cache=invalidate_cache,
                         get_preferences=get_preferences,
+                        get_dsb_plan=load_dsb_plan if get_dsb_plan else None,
                     )
             except asyncio.CancelledError:
                 raise
@@ -974,14 +1032,22 @@ async def run_message_notification_scheduler(
     get_client: Callable[[str], Awaitable[Any]],
     invalidate_cache: Callable[[str, str], Awaitable[None]] | None = None,
     get_preferences: Callable[[str], Awaitable[Dict[str, Any]]] | None = None,
+    *,
+    get_dsb_plan: DsbPlanLoader | None = None,
 ) -> asyncio.Task:
     """Start the long-running daytime message polling task."""
     async def _loop() -> None:
         logger.info("Message notification scheduler started")
+        last_dsb_slot = None
         while True:
             try:
+                dsb_slot = _dsb_poll_slot() if get_dsb_plan is not None else None
+                poll_dsb = dsb_slot is not None and dsb_slot != last_dsb_slot
+                if poll_dsb:
+                    last_dsb_slot = dsb_slot
                 await run_message_notification_cycle(
-                    get_client, invalidate_cache, get_preferences
+                    get_client, invalidate_cache, get_preferences,
+                    get_dsb_plan=get_dsb_plan if poll_dsb else None,
                 )
             except asyncio.CancelledError:
                 raise
