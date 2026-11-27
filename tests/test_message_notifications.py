@@ -595,13 +595,16 @@ def test_scheduler_delivers_dsb_changes_even_when_native_plan_is_unavailable(mon
         "enabled": True,
         "messages_enabled": False,
         "vertretungsplan_enabled": True,
-        "start_time": "00:00",
-        "end_time": "00:00",
+        "start_time": "18:00",
+        "end_time": "19:00",
+        "poll_interval_minutes": 60,
+        "timezone": "America/New_York",
     }
     users = {
         "matching": ("1234", "8a"),
         "other-class": ("1234", "9a"),
         "other-school": ("5678", "8a"),
+        "opted-out": ("1234", "8a"),
     }
     states = {}
     sent = []
@@ -630,7 +633,10 @@ def test_scheduler_delivers_dsb_changes_even_when_native_plan_is_unavailable(mon
         return SimpleNamespace(client=NativeClient(users[user_id][1]))
 
     async def get_users():
-        return [{"user_id": user_id, **preferences} for user_id in users]
+        return [
+            {**preferences, "user_id": user_id, "vertretungsplan_enabled": user_id != "opted-out"}
+            for user_id in users
+        ]
 
     async def get_session(user_id):
         return {"school_id": users[user_id][0]}
@@ -674,31 +680,69 @@ def test_scheduler_delivers_dsb_changes_even_when_native_plan_is_unavailable(mon
             }],
         }
 
-    async def poll(result):
+    async def poll(hour, minute, result):
         nonlocal dsb_plan
         dsb_plan = result
-        for state in states.values():
-            state["checked_at"] = "2000-01-01T00:00:00+00:00"
-        await lanis_api.sessions.invalidate_endpoint_cache("dsb-school:1234", "/dsb/school-plan")
         await notifications.run_message_notification_cycle(
-            get_client, get_dsb_plan=lanis_api._get_cached_school_dsb_plan
+            get_client,
+            get_dsb_plan=lanis_api._refresh_school_dsb_plan,
+            now=datetime(2026, 8, 28, hour, minute, tzinfo=ZoneInfo("Europe/Berlin")),
         )
 
     async def scenario():
-        await poll(plan("101"))
-        await poll({"success": False, "error": "DSB unavailable"})
+        await poll(6, 55, plan("999"))
+        assert fetches == []
+        await poll(7, 0, plan("101"))
+        await poll(7, 5, {"success": False, "error": "DSB unavailable"})
         assert sent == []
-        await poll(plan("202"))
-        await poll(plan("202"))
+        await poll(7, 10, plan("202"))
+        await poll(7, 15, plan("202"))
+        await poll(16, 0, plan("999"))
 
     asyncio.run(scenario())
     assert fetches == [("school-account", "test-password")] * 4
-    assert "dsb" not in states["other-school"]
+    assert "dsb" not in states.get("other-school", {})
+    assert "opted-out" not in states
     [(user_id, payload)] = sent
     assert user_id == "matching"
     assert payload["url"] == "/dsb"
     assert "DSBmobile" in payload["title"]
     assert "Raum 202" in payload["body"]
+
+
+def test_scheduler_passes_dsb_loader_once_per_five_minute_berlin_slot(monkeypatch):
+    moments = iter([(6, 59), (7, 0), (7, 1), (7, 5), (15, 55), (15, 59), (16, 0)])
+    berlin = ZoneInfo("Europe/Berlin")
+    observed = []
+    poll_slot = notifications._dsb_poll_slot
+
+    def next_slot():
+        hour, minute = next(moments)
+        return poll_slot(datetime(2026, 8, 28, hour, minute, tzinfo=berlin))
+
+    async def cycle(*args, get_dsb_plan=None):
+        observed.append(get_dsb_plan is not None)
+
+    async def sleep(_seconds):
+        if len(observed) == 7:
+            raise asyncio.CancelledError
+
+    async def fetch_plan(_school_id):
+        return None
+
+    monkeypatch.setattr(notifications, "_dsb_poll_slot", next_slot)
+    monkeypatch.setattr(notifications, "run_message_notification_cycle", cycle)
+    monkeypatch.setattr(notifications, "asyncio", SimpleNamespace(
+        create_task=asyncio.create_task, sleep=sleep, CancelledError=asyncio.CancelledError,
+    ))
+
+    async def scenario():
+        scheduler = await notifications.run_message_notification_scheduler(None, get_dsb_plan=fetch_plan)
+        with pytest.raises(asyncio.CancelledError):
+            await scheduler
+
+    asyncio.run(scenario())
+    assert observed == [False, True, False, True, True, False, False]
 
 
 def test_vertretungsplan_poll_rebaselines_when_the_users_own_class_changes(monkeypatch):

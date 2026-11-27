@@ -1599,7 +1599,7 @@ async def _startup() -> None:
         sessions._get_or_create_schulportal_client,
         sessions.invalidate_endpoint_cache,
         get_notification_preferences,
-        get_dsb_plan=_get_cached_school_dsb_plan,
+        get_dsb_plan=_refresh_school_dsb_plan,
     )
     _uptime_scheduler_task = await run_uptime_scheduler()
     _whatsapp_history_cleanup_task = asyncio.create_task(_run_whatsapp_history_cleanup())
@@ -2424,6 +2424,10 @@ async def _get_cached_school_dsb_plan(
         if result.get("success"):
             await sessions.set_cache(owner, "/dsb/school-plan", result, params)
         return result
+
+
+async def _refresh_school_dsb_plan(school_id: str) -> Dict[str, Any] | None:
+    return await _get_cached_school_dsb_plan(school_id, refresh=True)
 
 
 @app.get("/dsb/school-plan")
