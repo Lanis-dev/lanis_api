@@ -587,6 +587,120 @@ def test_vertretungsplan_poll_baselines_then_notifies_for_a_new_own_class_entry(
     assert "10b" not in sent_payloads[0]["body"]
 
 
+def test_scheduler_delivers_dsb_changes_even_when_native_plan_is_unavailable(monkeypatch):
+    from api import api as lanis_api
+
+    preferences = {
+        **auth_db.DEFAULT_NOTIFICATION_PREFERENCES,
+        "enabled": True,
+        "messages_enabled": False,
+        "vertretungsplan_enabled": True,
+        "start_time": "00:00",
+        "end_time": "00:00",
+    }
+    users = {
+        "matching": ("1234", "8a"),
+        "other-class": ("1234", "9a"),
+        "other-school": ("5678", "8a"),
+    }
+    states = {}
+    sent = []
+    fetches = []
+    dsb_plan = {}
+
+    class NativeClient:
+        def __init__(self, class_name):
+            self.class_name = class_name
+
+        def vertretungsplan_get_plan(self, _include_raw):
+            return {"success": False, "error": "Native module unavailable"}
+
+        def benutzer_get_data(self):
+            return {"success": True, "data": {"klasse": self.class_name}}
+
+    class DsbClient:
+        def dsb_get_substitution_plan(self, username, password):
+            fetches.append((username, password))
+            return dsb_plan
+
+        def close(self):
+            pass
+
+    async def get_client(user_id):
+        return SimpleNamespace(client=NativeClient(users[user_id][1]))
+
+    async def get_users():
+        return [{"user_id": user_id, **preferences} for user_id in users]
+
+    async def get_session(user_id):
+        return {"school_id": users[user_id][0]}
+
+    async def get_state(user_id):
+        return states.get(user_id)
+
+    async def save_state(user_id, state):
+        states[user_id] = state
+
+    async def get_subscriptions(_user_id):
+        return [{"endpoint": "https://push.example/subscription"}]
+
+    async def send_push(user_id, deliveries):
+        sent.extend((user_id, payload) for _subscription, payload in deliveries.values())
+        return {endpoint: "delivered" for endpoint in deliveries}
+
+    monkeypatch.setenv("DSB_SCHOOL_ID", "1234")
+    monkeypatch.setenv("DSB_USERNAME", "school-account")
+    monkeypatch.setenv("DSB_PASSWORD", "test-password")
+    monkeypatch.setattr(lanis_api, "SchulportalHessenAPI", DsbClient)
+    monkeypatch.setattr(lanis_api, "sessions", lanis_api.AuthManager())
+    monkeypatch.setattr(lanis_api, "_school_dsb_lock", asyncio.Lock())
+    monkeypatch.setattr(auth_db, "get_refresh_token_by_user_id", get_session)
+    monkeypatch.setattr(notifications, "get_enabled_notification_users", get_users)
+    monkeypatch.setattr(notifications, "get_vertretungsplan_notification_state", get_state)
+    monkeypatch.setattr(notifications, "save_vertretungsplan_notification_state", save_state)
+    monkeypatch.setattr(notifications, "get_push_subscriptions", get_subscriptions)
+    monkeypatch.setattr(notifications, "_send_push_payloads", send_push)
+
+    def plan(room):
+        return {
+            "success": True,
+            "tables": [{
+                "date": "2026-08-28",
+                "headers": ["Klasse(n)", "Stunde", "Fach", "Art", "Raum"],
+                "rows": [
+                    ["08A", "3", "Mathe", "Raumänderung", room],
+                    ["09A", "4", "Deutsch", "Ausfall", ""],
+                ],
+            }],
+        }
+
+    async def poll(result):
+        nonlocal dsb_plan
+        dsb_plan = result
+        for state in states.values():
+            state["checked_at"] = "2000-01-01T00:00:00+00:00"
+        await lanis_api.sessions.invalidate_endpoint_cache("dsb-school:1234", "/dsb/school-plan")
+        await notifications.run_message_notification_cycle(
+            get_client, get_dsb_plan=lanis_api._get_cached_school_dsb_plan
+        )
+
+    async def scenario():
+        await poll(plan("101"))
+        await poll({"success": False, "error": "DSB unavailable"})
+        assert sent == []
+        await poll(plan("202"))
+        await poll(plan("202"))
+
+    asyncio.run(scenario())
+    assert fetches == [("school-account", "test-password")] * 4
+    assert "dsb" not in states["other-school"]
+    [(user_id, payload)] = sent
+    assert user_id == "matching"
+    assert payload["url"] == "/dsb"
+    assert "DSBmobile" in payload["title"]
+    assert "Raum 202" in payload["body"]
+
+
 def test_vertretungsplan_poll_rebaselines_when_the_users_own_class_changes(monkeypatch):
     state = None
     sent_payloads = []

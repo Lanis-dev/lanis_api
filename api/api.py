@@ -1599,6 +1599,7 @@ async def _startup() -> None:
         sessions._get_or_create_schulportal_client,
         sessions.invalidate_endpoint_cache,
         get_notification_preferences,
+        get_dsb_plan=_get_cached_school_dsb_plan,
     )
     _uptime_scheduler_task = await run_uptime_scheduler()
     _whatsapp_history_cleanup_task = asyncio.create_task(_run_whatsapp_history_cleanup())
@@ -2391,20 +2392,14 @@ def _school_dsb_credentials(school_id: str) -> tuple[str, str] | None:
     return (username, password) if username and password else None
 
 
-@app.get("/dsb/school-plan")
-async def get_school_dsb_plan(
-    refresh: bool = False,
-    auth: AuthSession = Depends(client_dependency),
-) -> Dict[str, object]:
-    """Return the configured school's shared, cached DSB plan without credentials."""
-    credentials = _school_dsb_credentials(auth.school_id)
+async def _get_cached_school_dsb_plan(
+    school_id: str, refresh: bool = False,
+) -> Dict[str, Any] | None:
+    """Share the configured school's DSB plan between requests and push polls."""
+    credentials = _school_dsb_credentials(school_id)
     if credentials is None:
-        return {
-            "success": False,
-            "tables": [],
-            "error": "DSB ist für diese Schule nicht eingerichtet.",
-        }
-    owner = f"dsb-school:{auth.school_id}"
+        return None
+    owner = f"dsb-school:{school_id}"
     # Configuration changes must not reuse another DSB account's cached plan.
     params = hashlib.sha256(json.dumps(credentials).encode()).hexdigest()
     async with _school_dsb_lock:
@@ -2429,6 +2424,22 @@ async def get_school_dsb_plan(
         if result.get("success"):
             await sessions.set_cache(owner, "/dsb/school-plan", result, params)
         return result
+
+
+@app.get("/dsb/school-plan")
+async def get_school_dsb_plan(
+    refresh: bool = False,
+    auth: AuthSession = Depends(client_dependency),
+) -> Dict[str, object]:
+    """Return the configured school's shared, cached DSB plan without credentials."""
+    result = await _get_cached_school_dsb_plan(auth.school_id, refresh=refresh)
+    if result is not None:
+        return result
+    return {
+        "success": False,
+        "tables": [],
+        "error": "DSB ist für diese Schule nicht eingerichtet.",
+    }
 
 
 @app.get("/stundenplan/view")
